@@ -1,0 +1,169 @@
+# 代码整体目录结构
+├── AUTHORS
+├── CMakeLists.txt
+├── CONTRIBUTING.md
+├── LICENSE
+├── NEWS
+├── README.md
+├── TODO
+├── doc/         # 说明文档, 包括sstable和log的格式介绍
+├── include/     # 使用者需要的头文件
+├── db/          # 主逻辑的实现
+├── table/       # sstable相关的数据格式定义以及操作实现
+├── util/        # 通用工具类(内存管理/LRU/coding/crc32/hash/random)的实现
+├── port/        # 系统环境(锁/信号/原子操作/压缩)封装, 以便于移植
+├── helpers/     # 实现了一个完全基于内存的简单文件系统
+├── benchmarks/  # 压力器的实现
+├── issues/
+└── cmake/
+
+# include目录下的源码文件清单
+include/
+└── leveldb/
+    ├── c.h
+    ├── cache.h
+    ├── comparator.h
+    ├── db.h
+    ├── dumpfile.h
+    ├── env.h
+    ├── export.h
+    ├── filter_policy.h
+    ├── iterator.h
+    ├── options.h
+    ├── slice.h
+    ├── status.h
+    ├── table.h
+    ├── table_builder.h
+    └── write_batch.h
+
+# db目录下的源码文件清单
+db/
+├── autocompact_test.cc
+├── builder.cc
+├── builder.h
+├── c.cc
+├── c_test.c
+├── corruption_test.cc
+├── db_impl.cc
+├── db_impl.h
+├── db_iter.cc
+├── db_iter.h
+├── db_test.cc
+├── dbformat.cc
+├── dbformat.h
+├── dbformat_test.cc
+├── dumpfile.cc
+├── fault_injection_test.cc
+├── filename.cc
+├── filename.h
+├── filename_test.cc
+├── leveldbutil.cc
+├── log_format.h
+├── log_reader.cc
+├── log_reader.h
+├── log_test.cc
+├── log_writer.cc
+├── log_writer.h
+├── memtable.cc
+├── memtable.h
+├── recovery_test.cc
+├── repair.cc
+├── skiplist.h
+├── skiplist_test.cc
+├── snapshot.h
+├── table_cache.cc
+├── table_cache.h
+├── version_edit.cc
+├── version_edit.h
+├── version_edit_test.cc
+├── version_set.cc
+├── version_set.h
+├── version_set_test.cc
+├── write_batch.cc
+├── write_batch_internal.h
+└── write_batch_test.cc
+
+# table目录下的源码文件清单
+table/
+├── block.cc
+├── block.h
+├── block_builder.cc
+├── block_builder.h
+├── filter_block.cc
+├── filter_block.h
+├── filter_block_test.cc
+├── format.cc
+├── format.h
+├── iterator.cc
+├── iterator_wrapper.h
+├── merger.cc
+├── merger.h
+├── table.cc
+├── table_builder.cc
+├── table_test.cc
+├── two_level_iterator.cc
+└── two_level_iterator.h
+
+# util目录下的源码文件清单
+util/
+├── arena.cc
+├── arena.h
+├── arena_test.cc
+├── bloom.cc
+├── bloom_test.cc
+├── cache.cc
+├── cache_test.cc
+├── coding.cc
+├── coding.h
+├── coding_test.cc
+├── comparator.cc
+├── crc32c.cc
+├── crc32c.h
+├── crc32c_test.cc
+├── env.cc
+├── env_posix.cc
+├── env_posix_test.cc
+├── env_posix_test_helper.h
+├── env_test.cc
+├── env_windows.cc
+├── env_windows_test.cc
+├── env_windows_test_helper.h
+├── filter_policy.cc
+├── hash.cc
+├── hash.h
+├── hash_test.cc
+├── histogram.cc
+├── histogram.h
+├── logging.cc
+├── logging.h
+├── logging_test.cc
+├── mutexlock.h
+├── no_destructor.h
+├── no_destructor_test.cc
+├── options.cc
+├── posix_logger.h
+├── random.h
+├── status.cc
+├── status_test.cc
+├── testharness.cc
+├── testharness.h
+├── testutil.cc
+├── testutil.h
+└── windows_logger.h
+
+# port目录下的源码文件清单
+port/
+├── README.md
+├── port.h
+├── port_config.h.in
+├── port_example.h
+├── port_stdcxx.h
+└── thread_annotations.h
+
+# helpers目录下的源码文件清单
+helpers/
+└── memenv/
+    ├── memenv.cc
+    ├── memenv.h
+    └── memenv_test.cc
+
