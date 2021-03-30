@@ -1193,36 +1193,66 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 }
 
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+  // 初始化本次写入的上下文w
   Writer w(&mutex_);
-  w.batch = updates;
-  w.sync = options.sync;
-  w.done = false;
+  w.batch = updates;      // 本次写入实际更新的数据
+  w.sync = options.sync;  // 本次写入过程中是否sync(根据传入选项决定)
+  w.done = false;         // 本次写入的状态(当前是未完成)
 
-  MutexLock l(&mutex_);
-  writers_.push_back(&w);
+  // 将 w 塞入 writers_ 队列
+  MutexLock l(&mutex_);   // writers_队列是多线程共享的, 操作前需加锁.
+                          // * mutex_是DBImpl仅有的一个互斥锁(另有一个文件锁),
+                          //   也是leveldb的全局锁, 所有操作都要基于此实现互斥;
+                          // * MutexLock是个自动锁, 加锁和解锁分别在其构造函数
+                          //   和析构函数中自动完成.
+  writers_.push_back(&w); // 入队(writers_是个双端队列, std::deque<Writer*>)
+
+  // 循环等待, 直到被唤醒后发现满足以下两个条件之一:
+  // (1) w.done == true, 意为w已经写入(其它线程顺手把w的更新数据一块写入);
+  // (2) w == writers_.front(), 队列里w之前的写请求都已完成, 轮到当前线程开写;
+  // 这段循环保证了写入是按照调用的先后顺序执行的.
   while (!w.done && &w != writers_.front()) {
+    // w.cv是port::CondVar类型, 是对不同平台上条件变量的简单封装; 在Linux平台,
+    // 封装层次为 port::CondVar ==> std::condition_variable ==> pthread_cond_t,
+    // 简单起见, 直接把w.cv理解为一个pthread_cond_t的变量即可.
+    // 在当前线程因不满足条件被阻塞的时候, 依据条件变量的实现, w.cv.Wait()内部
+    // 会先对 mutex_ 解锁, 其它线程可以将新的写请求加入到writers_队列.
     w.cv.Wait();
   }
   if (w.done) {
+    // 针对条件(1)的场景, 当前请求的更新已经由其它线程帮忙写入, 直接返回结果
     return w.status;
   }
 
-  // May temporarily unlock and wait.
+  // 正式开始处理写请求 w (May temporarily unlock and wait.)
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
+    // 在满足策略限制的情况下, 尽量把更多写请求合并为一个batch写请求一次写入
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
+    // 为这个batch写请求设置序列号(batch内的各个写请求是否共用同一个序列号?)
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
+    // 临时记录LastSequence(已分配的最大序列号)到local变量
     last_sequence += WriteBatchInternal::Count(write_batch);
 
     // Add to log and apply to memtable.  We can release the lock
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
+    // 写日志并且更新memtable.   鉴于 &w 掌握了当前的日志写入权并且(有机制)可以
+    // 防止并发的日志写入和并发的mem_更新, 在此阶段我们可以(临时)释放锁.
     {
+      // 在实际写log之前解锁(因为后续有比较重的写盘甚至sync操作, 不解锁性能低)
+      // 此时其他线程可以同时读取或者写入leveldb:
+      // * 对于新的写请求, 会被放到 writers_ 队尾等待, 前面已经解释过 writers_
+      //   队列可以保证写请求按序执行;
+      // * 对于并发读请求(先MemTable后SSTable), 它和当前写请求之间的争抢只存在
+      //   于MemTable, 而MemTable内部通过原子变量保证了读写线程之间的安全.
       mutex_.Unlock();
+      // 将batch写请求的内容追加到log_文件末尾
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+      // 对log_文件执行一次sync操作(如果用户传入的选项里指定需要sync)
       bool sync_error = false;
       if (status.ok() && options.sync) {
         status = logfile_->Sync();
@@ -1230,71 +1260,100 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
           sync_error = true;
         }
       }
+      // 把更新内容也apply到MemTable中(仅当log_文件写入成功的情况下)
       if (status.ok()) {
         status = WriteBatchInternal::InsertInto(write_batch, mem_);
       }
+      // 重新进入加锁状态(耗时大的操作都已完成, 且马上要操作共享资源)
       mutex_.Lock();
+      // 对sync操作失败情况的额外处理: 记录bg_error_, 并唤醒所有的线程
       if (sync_error) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
         // So we force the DB into a mode where all future writes fail.
+        // (在sync操作失败的情况下)log_文件目前处于未定状态: 当前DB被重新打开的
+        // 时候, 刚刚追加的记录是否生效是不确定的.
+        // (为了避免这种不确定性可能导致的一致性问题)我们强制当前DB进入保护模式
+        // 并拒绝后续的所有新写入. (算是在CA之间做取舍, 这种全面偏向C的处理方式
+        // 容易导致可用性的问题, 可以考虑适当的重试做折衷.)
         RecordBackgroundError(status);
       }
     }
+    // 释放缓存拼接后batch写请求内容的tmp_batch_对象.(仅当BuildBatchGroup()之时
+    // 实际发生了请求合并的情况下, 才会借用tmp_batch_对象完成拼接, 这里也才需要
+    // 专门清空tmp_batch_对象来避免污染下次合并的数据, 这是if判断的意义)
     if (write_batch == tmp_batch_) tmp_batch_->Clear();
 
+    // 实际更新当前DB的LastSequence(写入操作已经成功)
     versions_->SetLastSequence(last_sequence);
   }
 
+  // 依次处理 writers_ 队列中被合并的写请求, 通知其相应的线程
   while (true) {
+    // 取出 writers_ 队列队首请求
     Writer* ready = writers_.front();
     writers_.pop_front();
+    // 对被合入的写请求中, 所有非当前线程本身所own的写请求owner线程发送就绪通知
     if (ready != &w) {
-      ready->status = status;
-      ready->done = true;
-      ready->cv.Signal();
+      ready->status = status;  // 记录请求写入结果
+      ready->done = true;      // 标记请求已完成
+      ready->cv.Signal();      // 唤醒owner线程(当前依然被锁住, 未真正唤醒)
     }
+    // 已经处理完所有被合并的写请求, 跳出循环(last_writer是在BuildBatchGroup()
+    // 中维护的指针, 指向最后一个被合并的写请求)
     if (ready == last_writer) break;
   }
 
   // Notify new head of write queue
+  // 通知 writers_ 队列新的队首写请求owner(当前未被处理的第一个写请求)
   if (!writers_.empty()) {
     writers_.front()->cv.Signal();
   }
 
+  // 返回当前写请求的结果
   return status;
 }
 
 // REQUIRES: Writer list must be non-empty
 // REQUIRES: First writer must have a non-null batch
+// 在不违反策略限制的情况下, 尽量把更多单个写请求合并为一个大的batch写请求.
 WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
   mutex_.AssertHeld();
   assert(!writers_.empty());
-  Writer* first = writers_.front();
-  WriteBatch* result = first->batch;
+  Writer* first = writers_.front();   // 记录合并前的队列头部写请求(没啥必要?)
+  WriteBatch* result = first->batch;  // 记录合并后的batch写请求
   assert(result != nullptr);
 
+  // 记录合并后的batch写请求总size
   size_t size = WriteBatchInternal::ByteSize(first->batch);
 
   // Allow the group to grow up to a maximum size, but if the
   // original write is small, limit the growth so we do not slow
   // down the small write too much.
+  // 默认合并后的batch写请求的总IO size上限是1MB这样一个较大的值. 但若first请求
+  // 本身是小于128KB的小块写, 则合入的那些单个写请求带来的IO size增量也不能超过
+  // 128KB, 以此保证合并后的batch请求耗时相比合并前的单个first请求不会增加太多.
   size_t max_size = 1 << 20;
   if (size <= (128 << 10)) {
     max_size = size + (128 << 10);
   }
 
-  *last_writer = first;
+  *last_writer = first;  // 记录合并在batch里的最后一个单请求
   std::deque<Writer*>::iterator iter = writers_.begin();
-  ++iter;  // Advance past "first"
+  ++iter;  // Advance past "first"(跳过队首的first写请求自身)
   for (; iter != writers_.end(); ++iter) {
     Writer* w = *iter;
+    // 检查当前写请求的sync选项是否满足策略要求
     if (w->sync && !first->sync) {
       // Do not include a sync write into a batch handled by a non-sync write.
+      // 如果first请求本身是不带sync选项的, 则为保证合并后的batch请求耗时不会比
+      // 单个first请求增加太多, 会禁止合入带sync选项的写请求.
       break;
     }
 
+    // 只需要对有update数据的写请求做实际的合并(NULL batch is for compactions)
     if (w->batch != nullptr) {
+      // 检查当前写请求如果合并进来是否会导致batch写请求的总IO size超出限制
       size += WriteBatchInternal::ByteSize(w->batch);
       if (size > max_size) {
         // Do not make batch too big
@@ -1302,6 +1361,9 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
       }
 
       // Append to *result
+      // 将当前写请求的update数据拼接到batch写请求尾部(拼接过程中, 为了避免污染
+      // 用户传入的原始请求, 不会直接修改first请求的batch成员, 而是用了一个临时
+      // 对象tmp_batch_来完成拼接)
       if (result == first->batch) {
         // Switch to temporary batch instead of disturbing caller's batch
         result = tmp_batch_;
@@ -1310,6 +1372,7 @@ WriteBatch* DBImpl::BuildBatchGroup(Writer** last_writer) {
       }
       WriteBatchInternal::Append(result, w->batch);
     }
+    // 每合入一个写请求都需要更新传入的last_writer指针
     *last_writer = w;
   }
   return result;
